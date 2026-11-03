@@ -2,7 +2,6 @@ from flask import Flask, render_template, request, send_file
 import pandas as pd
 import numpy as np
 import joblib
-import os
 import json
 
 from pathlib import Path
@@ -23,10 +22,10 @@ from reportlab.lib.styles import getSampleStyleSheet
 app = Flask(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-
 MODEL_DIR = BASE_DIR / "model"
 
-app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024
+# Allow CSV uploads up to 100 MB
+app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024
 
 
 # ==========================================
@@ -65,21 +64,15 @@ def get_dashboard_data():
         if total_records > 0 else 0
     )
 
-    # Attack category distribution
-    attack_data = (
-        if_results["Attack_Category"]
-        .value_counts()
-    )
+    attack_data = if_results["Attack_Category"].value_counts()
 
     attack_labels = attack_data.index.tolist()
     attack_counts = attack_data.values.tolist()
 
-    # Anomaly records
     anomaly_records = if_results[
         if_results["Status"] == "Anomaly"
     ].head(100).to_dict(orient="records")
 
-    # DBSCAN visualization data
     if {"PCA_X", "PCA_Y", "DBSCAN_Result"}.issubset(
         db_data.columns
     ):
@@ -93,7 +86,6 @@ def get_dashboard_data():
     else:
         dbscan_visual = []
 
-    # Model comparison table
     comparison_columns = comparison_data.columns.tolist()
 
     comparison_rows = json.loads(
@@ -101,33 +93,20 @@ def get_dashboard_data():
     )
 
     return {
-
         "total_records": total_records,
-
         "normal_count": normal_count,
-
         "anomaly_count": anomaly_count,
-
         "anomaly_rate": anomaly_rate,
-
         "attack_labels": attack_labels,
-
         "attack_counts": attack_counts,
-
         "anomaly_records": anomaly_records,
-
         "comparison_columns": comparison_columns,
-
         "comparison_rows": comparison_rows,
-
         "dbscan_visual": dbscan_visual,
-
         "dbscan_total": len(db_data),
-
         "dbscan_noise": int(
             (db_data["DBSCAN_Result"] == -1).sum()
         )
-
     }
 
 
@@ -159,106 +138,172 @@ def detect():
     normal_count = 0
     anomaly_count = 0
     total_records = 0
+    error = None
 
     if request.method == "POST":
 
         file = request.files.get("file")
 
-        if file and file.filename.endswith(".csv"):
+        if not file or file.filename == "":
+            error = "Please select a CSV file."
 
-            uploaded_data = pd.read_csv(file)
+        elif not file.filename.lower().endswith(".csv"):
+            error = "Please upload a valid CSV file."
 
-            # Load saved model files
-            model = joblib.load(
-                MODEL_DIR / "isolation_forest.pkl"
-            )
+        else:
 
-            scaler = joblib.load(
-                MODEL_DIR / "scaler.pkl"
-            )
+            try:
 
-            saved_features = joblib.load(
-                MODEL_DIR / "features.pkl"
-            )
+                # Load saved model files once
+                model = joblib.load(
+                    MODEL_DIR / "isolation_forest.pkl"
+                )
 
-            # Remove unnecessary columns
-            features = uploaded_data.drop(
-                columns=[
-                    "id",
-                    "attack_cat",
-                    "label"
-                ],
-                errors="ignore"
-            )
+                scaler = joblib.load(
+                    MODEL_DIR / "scaler.pkl"
+                )
 
-            # Convert categorical columns
-            categorical_columns = [
-                col for col in ["proto", "service", "state"]
-                if col in features.columns
-            ]
+                saved_features = joblib.load(
+                    MODEL_DIR / "features.pkl"
+                )
 
-            features = pd.get_dummies(
-                features,
-                columns=categorical_columns,
-                dtype=int
-            )
+                result_file = (
+                    MODEL_DIR / "uploaded_detection_results.csv"
+                )
 
-            # Match training features
-            features = features.reindex(
-                columns=saved_features,
-                fill_value=0
-            )
+                total_records = 0
+                normal_count = 0
+                anomaly_count = 0
 
-            features = features.replace(
-                [np.inf, -np.inf],
-                np.nan
-            )
+                # Process CSV in batches
+                with open(result_file, "w", newline="") as output:
 
-            features = features.fillna(0)
+                    first_batch = True
 
-            # Scale data
-            scaled_data = scaler.transform(features)
+                    for uploaded_data in pd.read_csv(
+                        file,
+                        chunksize=5000
+                    ):
 
-            # Predict anomalies
-            predictions = model.predict(scaled_data)
+                        # Remove unnecessary columns
+                        features = uploaded_data.drop(
+                            columns=[
+                                "id",
+                                "attack_cat",
+                                "label"
+                            ],
+                            errors="ignore"
+                        )
 
-            results = pd.DataFrame({
+                        # Convert categorical columns
+                        categorical_columns = [
+                            col for col in [
+                                "proto",
+                                "service",
+                                "state"
+                            ]
+                            if col in features.columns
+                        ]
 
-                "Record_Number": range(
-                    1, len(predictions) + 1
-                ),
+                        features = pd.get_dummies(
+                            features,
+                            columns=categorical_columns,
+                            dtype=int
+                        )
 
-                "Prediction": predictions,
+                        # Match training features
+                        features = features.reindex(
+                            columns=saved_features,
+                            fill_value=0
+                        )
 
-                "Status": [
-                    "Normal" if x == 1 else "Anomaly"
-                    for x in predictions
-                ]
+                        features = features.replace(
+                            [np.inf, -np.inf],
+                            np.nan
+                        )
 
-            })
+                        features = features.fillna(0)
 
-            total_records = len(results)
+                        # Scale current batch
+                        scaled_data = scaler.transform(features)
 
-            normal_count = int(
-                (results["Status"] == "Normal").sum()
-            )
+                        # Predict anomalies
+                        predictions = model.predict(scaled_data)
 
-            anomaly_count = int(
-                (results["Status"] == "Anomaly").sum()
-            )
+                        batch_results = pd.DataFrame({
 
-            # Save detection results
-            results.to_csv(
-                MODEL_DIR / "uploaded_detection_results.csv",
-                index=False
-            )
+                            "Record_Number": range(
+                                total_records + 1,
+                                total_records + len(predictions) + 1
+                            ),
+
+                            "Prediction": predictions,
+
+                            "Status": [
+                                "Normal" if x == 1 else "Anomaly"
+                                for x in predictions
+                            ]
+
+                        })
+
+                        # Update counts
+                        batch_normal = int(
+                            (batch_results["Status"] == "Normal").sum()
+                        )
+
+                        batch_anomaly = int(
+                            (batch_results["Status"] == "Anomaly").sum()
+                        )
+
+                        normal_count += batch_normal
+                        anomaly_count += batch_anomaly
+                        total_records += len(batch_results)
+
+                        # Save each batch immediately
+                        batch_results.to_csv(
+                            output,
+                            index=False,
+                            header=first_batch
+                        )
+
+                        first_batch = False
+
+                        del uploaded_data
+                        del features
+                        del scaled_data
+                        del predictions
+                        del batch_results
+
+                # Load only a small preview for the result page
+                results = pd.read_csv(
+                    result_file,
+                    nrows=100
+                )
+
+            except Exception as e:
+
+                error = "Detection failed: " + str(e)
 
     return render_template(
         "detect.html",
         results=results,
         normal_count=normal_count,
         anomaly_count=anomaly_count,
-        total_records=total_records
+        total_records=total_records,
+        error=error
+    )
+
+
+# ==========================================
+# FILE SIZE ERROR
+# ==========================================
+
+@app.errorhandler(413)
+def file_too_large(error):
+
+    return (
+        "File is too large. Please upload a CSV file smaller than 100 MB.",
+        413
     )
 
 
@@ -337,36 +382,23 @@ def report():
     )
 
     summary = [
-
         ["Description", "Value"],
-
         ["Total Records", str(data["total_records"])],
-
         ["Normal Activities", str(data["normal_count"])],
-
         ["Detected Anomalies", str(data["anomaly_count"])],
-
         ["Anomaly Rate", str(data["anomaly_rate"]) + "%"],
-
         ["DBSCAN Sample Records", str(data["dbscan_total"])],
-
         ["DBSCAN Noise Records", str(data["dbscan_noise"])]
-
     ]
 
     table = Table(summary, colWidths=[250, 150])
 
     table.setStyle(
         TableStyle([
-
             ("BACKGROUND", (0, 0), (-1, 0), colors.darkblue),
-
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-
             ("GRID", (0, 0), (-1, -1), 1, colors.black),
-
             ("PADDING", (0, 0), (-1, -1), 8)
-
         ])
     )
 
@@ -412,5 +444,5 @@ def report():
 if __name__ == "__main__":
 
     app.run(
-        debug=True
+        debug=False
     )
